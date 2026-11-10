@@ -28,6 +28,8 @@ from .buckets import SQLiteBucket as SQLiteBucket
 from .buckets import SQLiteClock as SQLiteClock
 from .buckets import SQLiteQueries as SQLiteQueries
 from .clocks import AbstractClock as AbstractClock
+from .clocks import ClockConfigurationError as ClockConfigurationError
+from .clocks import ClockMismatchError as ClockMismatchError
 from .clocks import MonotonicAsyncClock as MonotonicAsyncClock
 from .clocks import MonotonicClock as MonotonicClock
 from .clocks import WallClock as WallClock
@@ -69,6 +71,8 @@ __all__ = [
     "SQLiteClock",
     "SQLiteQueries",
     "AbstractClock",
+    "ClockConfigurationError",
+    "ClockMismatchError",
     "MonotonicAsyncClock",
     "MonotonicClock",
     "WallClock",

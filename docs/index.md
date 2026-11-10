@@ -16,6 +16,7 @@
 :maxdepth: 2
 reference
 migrating
+clock-persistence
 changelog
 contributing
 modules/index

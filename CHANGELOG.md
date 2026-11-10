@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Clock semantics for persistent buckets.** `SQLiteBucket` now records a
+  small `<table>_meta` table (`clock_id`, `unit`, `high_water`) and accepts
+  an injectable `clock=` (default `WallClock`). Its effective clock is
+  dampened: it never runs backwards and never advances faster than real
+  (monotonic) time from the persisted high-water mark, so after a restart or
+  a wall-clock correction existing records age out gradually instead of
+  expiring all at once, a forward jump never hands out a full quota at once,
+  and a backward jump can no longer delay admission beyond one rate window
+  (large steps shift stored records by exactly the step). Clocks declare
+  `clock_id`/`is_persistent`; a monotonic clock on a file-backed bucket
+  raises `ClockConfigurationError`, and records the configured clock cannot
+  explain raise `ClockMismatchError` at startup instead of being
+  reinterpreted by guessing. See `docs/clock-persistence.md`.
+
 ### Fixed
 - **A blocking `try_acquire()` could give up on an item that fits.**
   `SlidingWindowLog.retry_after` returned `blocking_timestamp + interval - now + 1`,

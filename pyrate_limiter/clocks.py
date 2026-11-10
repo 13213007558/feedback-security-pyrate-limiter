@@ -13,8 +13,39 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class ClockConfigurationError(ValueError):
+    """The chosen clock cannot back a persistent bucket.
+
+    Raised at startup, before any record is written, so a misconfigured
+    service fails loudly instead of persisting timestamps that the next
+    process cannot interpret.
+    """
+
+
+class ClockMismatchError(RuntimeError):
+    """Persisted rate-limit records cannot be interpreted by the chosen clock.
+
+    Raised when a bucket's stored clock metadata (or the timestamps
+    themselves) conflicts with the configured clock. The library never
+    guesses a unit or epoch for records it cannot explain; the operator
+    must either configure the matching clock or flush/migrate the bucket.
+    """
+
+
 class AbstractClock(ABC):
     """Clock that return timestamp for `now`"""
+
+    #: Persistent identity of the timeline this clock counts on. Buckets that
+    #: outlive their process record it and refuse to reopen with a clock from
+    #: a different timeline. Clocks sharing an id are interchangeable for the
+    #: same bucket (e.g. WallClock and SQLiteClock both read the machine's
+    #: wall clock in epoch milliseconds).
+    clock_id: str = "abstract"
+
+    #: Whether timestamps stay meaningful across a process restart. Monotonic
+    #: clocks count from an unspecified, per-boot origin, so their records are
+    #: only usable by the process that wrote them.
+    is_persistent: bool = False
 
     @abstractmethod
     def now(self) -> Union[int, Awaitable[int]]:
@@ -37,6 +68,12 @@ class AbstractClock(ABC):
 
 
 class MonotonicClock(AbstractClock):
+    """In-memory-only clock: the origin resets on every reboot, so persisted
+    monotonic timestamps are uninterpretable to any later process."""
+
+    clock_id = "monotonic_ms"
+    is_persistent = False
+
     def now(self) -> int:
         """Get monotonic time in milliseconds"""
         return self._get_monotonic_ms()
@@ -50,12 +87,18 @@ class WallClock(AbstractClock):
     any bucket whose state is shared through Redis.
     """
 
+    clock_id = "wall_epoch_ms"
+    is_persistent = True
+
     def now(self) -> int:
         return self._get_wall_ms()
 
 
 class MonotonicAsyncClock(AbstractClock):
     """Monotonic Async Clock, meant for testing only"""
+
+    clock_id = "monotonic_ms"
+    is_persistent = False
 
     async def now(self) -> int:
         """Get monotonic time in milliseconds"""
@@ -64,6 +107,9 @@ class MonotonicAsyncClock(AbstractClock):
 
 class PostgresClock(AbstractClock):
     """Get timestamp using Postgres as remote clock backend"""
+
+    clock_id = "postgres_epoch_ms"
+    is_persistent = True
 
     def __init__(self, pool: "ConnectionPool"):
         self.pool = pool
