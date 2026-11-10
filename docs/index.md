@@ -15,6 +15,7 @@
 ```{toctree}
 :maxdepth: 2
 reference
+decision-ledgers
 migrating
 changelog
 contributing
