@@ -2,6 +2,7 @@
 
 import logging
 import sqlite3
+from contextlib import contextmanager
 from contextlib import nullcontext
 from pathlib import Path
 from tempfile import gettempdir
@@ -72,6 +73,11 @@ class SQLiteBucket(AbstractBucket):
     lock: RLock
     use_limiter_lock: bool
 
+    #: Milliseconds a write waits on another connection's lock before SQLite
+    #: raises OperationalError ("database is locked"). Covers the brief window
+    #: where a peer process holds the write transaction; no probabilistic retry.
+    busy_timeout_ms = 5_000
+
     def __init__(
         self,
         rates: List[Rate],
@@ -94,6 +100,27 @@ class SQLiteBucket(AbstractBucket):
         else:
             self.use_limiter_lock = True
             self.lock = lock
+
+    @contextmanager
+    def _write_transaction(self):
+        """Serialize a read-check-write across every connection to this file.
+
+        The connection runs in autocommit (``isolation_level=None``), so nothing
+        opens a transaction implicitly. ``BEGIN IMMEDIATE`` takes SQLite's
+        reserved (write) lock up front, before any count is read: a second
+        process blocks on the lock instead of reading the same pre-write count
+        and over-allocating. On a clean exit the work commits; any exception -
+        including a process torn down mid-flight - rolls back, so an uncommitted
+        admit leaves neither rows nor partial weight behind.
+        """
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except Exception:
+            self.conn.rollback()
+            raise
+        else:
+            self.conn.commit()
 
     def now(self):
         # TODO: Use Sqlite time source via a Lua script
@@ -121,36 +148,38 @@ class SQLiteBucket(AbstractBucket):
 
     def put(self, item: RateItem) -> bool:
         with self.lock:
-            query, parameters = self._build_full_count_query(item.timestamp)
-            cur = self.conn.execute(query, parameters)
-            rate_limit_counts = cur.fetchall()
-            cur.close()
+            with self._write_transaction():
+                query, parameters = self._build_full_count_query(item.timestamp)
+                cur = self.conn.execute(query, parameters)
+                rate_limit_counts = cur.fetchall()
+                cur.close()
 
-            # Each row is (interval, count); the UNION-of-COUNTs query returns
-            # them in ascending-interval order, matching self.rates. Verify that
-            # alignment, then defer the admit decision to the algorithm.
-            counts = []
-            for (interval, count), rate in zip(rate_limit_counts, self.rates, strict=True):
-                assert interval == rate.interval
-                counts.append(count)
+                # Each row is (interval, count); the UNION-of-COUNTs query returns
+                # them in ascending-interval order, matching self.rates. Verify that
+                # alignment, then defer the admit decision to the algorithm.
+                counts = []
+                for (interval, count), rate in zip(rate_limit_counts, self.rates, strict=True):
+                    assert interval == rate.interval
+                    counts.append(count)
 
-            decision = self._algorithm.decide(
-                self.rates,
-                counts,
-                item.weight,
-                item.timestamp,
-                self._peek_timestamp,
-            )
+                decision = self._algorithm.decide(
+                    self.rates,
+                    counts,
+                    item.weight,
+                    item.timestamp,
+                    self._peek_timestamp,
+                )
 
-            if not self._record(item, decision):
-                return False
+                if not self._record(item, decision):
+                    # Rejected inside the transaction: commit the empty write and
+                    # release the lock, persisting nothing for this item.
+                    return False
 
-            # Bind name + timestamp as parameters; never interpolate the
-            # user-supplied name into SQL (injection / quote-crash).
-            query = Queries.PUT_ITEM.format(table=self.table)
-            rows = [(item.name, item.timestamp)] * item.weight
-            self.conn.executemany(query, rows).close()
-            self.conn.commit()
+                # Bind name + timestamp as parameters; never interpolate the
+                # user-supplied name into SQL (injection / quote-crash).
+                query = Queries.PUT_ITEM.format(table=self.table)
+                rows = [(item.name, item.timestamp)] * item.weight
+                self.conn.executemany(query, rows).close()
             return True
 
     def _peek_timestamp(self, offset: int) -> Optional[int]:
@@ -174,22 +203,22 @@ class SQLiteBucket(AbstractBucket):
                 return 0
 
             assert current_timestamp is not None
-            query = Queries.COUNT_BEFORE_LEAK.format(
-                table=self.table,
-                lower_bound=self._algorithm.leak_bound(self.rates, current_timestamp),
-            )
-            cur = self.conn.execute(query)
-            count = cur.fetchone()[0]
-            query = Queries.LEAK.format(table=self.table, count=count)
-            cur.execute(query)
-            cur.close()
-            self.conn.commit()
+            with self._write_transaction():
+                query = Queries.COUNT_BEFORE_LEAK.format(
+                    table=self.table,
+                    lower_bound=self._algorithm.leak_bound(self.rates, current_timestamp),
+                )
+                cur = self.conn.execute(query)
+                count = cur.fetchone()[0]
+                query = Queries.LEAK.format(table=self.table, count=count)
+                cur.execute(query)
+                cur.close()
             return count
 
     def flush(self) -> None:
         with self.lock:
-            self.conn.execute(Queries.FLUSH.format(table=self.table)).close()
-            self.conn.commit()
+            with self._write_transaction():
+                self.conn.execute(Queries.FLUSH.format(table=self.table)).close()
             self.failing_rate = None
             self._last_wait = None
 
@@ -258,11 +287,18 @@ class SQLiteBucket(AbstractBucket):
         with file_lock_ctx:
             assert db_path is not None
 
+            # Autocommit (isolation_level=None): the driver never opens a
+            # transaction on its own, so put()/leak()/flush() control the exact
+            # boundaries with BEGIN IMMEDIATE ... COMMIT. This makes the
+            # read-check-write one serializable unit across processes rather
+            # than two separate autocommitted statements.
             sqlite_connection = sqlite3.connect(
                 db_path,
-                isolation_level="DEFERRED",
+                isolation_level=None,
                 check_same_thread=False,
+                timeout=cls.busy_timeout_ms / 1000,
             )
+            sqlite_connection.execute(f"PRAGMA busy_timeout={cls.busy_timeout_ms}")
 
             cur = sqlite_connection.cursor()
             if use_file_lock:
@@ -282,8 +318,6 @@ class SQLiteBucket(AbstractBucket):
 
             cur.execute(create_idx_query)
             cur.close()
-            sqlite_connection.commit()
-
             return cls(rates, sqlite_connection, table=table, lock=file_lock, algorithm=algorithm)
 
 
