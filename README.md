@@ -332,6 +332,35 @@ bucket = InMemoryBucket([Rate(5, Duration.SECOND)])
 limiter = Limiter(bucket, buffer_ms=100)
 ```
 
+### Fair waiting (per-bucket FIFO)
+
+By default blocking is **not** fair: every blocked waiter independently wakes when its
+retry delay elapses and races for whatever capacity just freed up. When requests carry
+different weights, a steady stream of small requests can keep grabbing each freed slot
+before a large request queued earlier, so that large request waits indefinitely.
+
+Opt into strict per-bucket FIFO with `fair_wait=True`:
+
+```python
+limiter = Limiter(Rate(10, Duration.SECOND), fair_wait=True)
+```
+
+The guarantees are:
+
+- Within one bucket, waiters are admitted strictly in enqueue order; a later request
+  cannot overtake the head even if its smaller weight would fit right now.
+- A weight above every rate's maximum capacity is rejected immediately and never
+  occupies the head of the queue.
+- A cancelled or timed-out waiter leaves promptly and promotes the next waiter.
+- Queues are per bucket, so a waiter on bucket `A` never gates bucket `B` (sync threads).
+- Waiting never holds the global limiter lock; the sync path parks on a
+  `threading.Event` and the async path on an `asyncio.Event`.
+
+Strict FIFO trades throughput for fairness: spare capacity a later small request could
+have used is left idle while the head waits for enough room, and head-of-line blocking
+delays everyone behind the same bucket. Leave `fair_wait` off (the default) unless the
+ordering guarantee matters.
+
 ### Weight
 
 Items can carry weight (default `1`). An item of weight `W` consumes `W` unit-slots atomically — either all `W` fit or none do:

@@ -11,6 +11,13 @@ from typing import Any, Awaitable, Callable, Iterable, List, Optional, Protocol,
 
 from .abstracts import AbstractBucket, BucketFactory, Rate, RateItem
 from .buckets import InMemoryBucket
+from .fair_queue import AsyncFairWaiter, FairQueueRegistry, SyncFairWaiter
+
+#: How often a fair head re-probes capacity while blocked. The head sleeps in
+#: short slices rather than one long ``waiting()`` estimate so it notices newly
+#: freed capacity (and its own deadline) promptly, and so tests driving a manual
+#: clock can make progress with bounded real-time waits.
+_FAIR_POLL_MS = 25
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +139,7 @@ class Limiter:
     bucket_factory: BucketFactory
     lock: Union[RLock, Iterable]
     buffer_ms: int
+    fair_wait: bool
 
     # async_lock is thread local, created on first use
     _thread_local: local
@@ -140,15 +148,25 @@ class Limiter:
         self,
         argument: Union[BucketFactory, AbstractBucket, Rate, List[Rate]],
         buffer_ms: int = 50,
+        fair_wait: bool = False,
     ):
         """Init Limiter using either a single bucket / multiple-bucket factory
         / single rate / rate list.
 
         Parameters:
             argument (Union[BucketFactory, AbstractBucket, Rate, List[Rate]]): The bucket or rate configuration.
+            buffer_ms (int): Extra milliseconds added to each blocking retry delay.
+            fair_wait (bool): When True, blocking waiters on the same bucket are
+                admitted strictly in enqueue order (per-bucket FIFO) instead of
+                racing for freed capacity. Defaults to False, preserving the
+                higher-throughput but non-fair behaviour. See
+                :mod:`pyrate_limiter.fair_queue` for the exact guarantees and
+                the throughput trade-off.
         """
 
         self.buffer_ms = buffer_ms
+        self.fair_wait = fair_wait
+        self._fair_queues = FairQueueRegistry()
         self.bucket_factory = self._init_bucket_factory(argument)
         self.lock = RLock()
         self._thread_local = local()
@@ -371,6 +389,175 @@ class Limiter:
                 assert isinstance(next_wait, int)
                 wait_ms = next_wait
 
+    def _refresh_item(self, item: RateItem) -> RateItem:
+        """Re-stamp ``item`` with the factory clock's current time.
+
+        Both fair-wait loops call this before every re-put so an item waiting
+        behind the head is tested against "now", not the timestamp it had when
+        it first queued. Mirrors the refresh in the async ``_delay_waiter``.
+        """
+        refreshed = self.bucket_factory.wrap_item(item.name, item.weight)
+        if isawaitable(refreshed):
+            return refreshed  # type: ignore[return-value]
+        assert isinstance(refreshed, RateItem)
+        item.timestamp = refreshed.timestamp
+        return item
+
+    def _fair_wait_sync(
+        self,
+        bucket: AbstractBucket,
+        item: RateItem,
+        deadline: Optional[float],
+    ) -> bool:
+        """Blocking FIFO wait for a sync caller, with the limiter lock released.
+
+        Two distinct blocking mechanisms keep the concerns separate:
+
+        * A waiter parked *behind* the head blocks on its promotion
+          :class:`threading.Event` (set only when it reaches the front), so it
+          never probes - and never overtakes - the head.
+        * The *head* alone probes capacity under the limiter lock, then sleeps
+          in short :data:`_FAIR_POLL_MS` slices (plain :func:`time.sleep`, lock
+          released) before re-probing, exactly like :meth:`_blocking_retry_sync`.
+
+        The promotion event is therefore never on the head's retry path, which
+        removes any lost-wake / busy-loop interaction between the two.
+        """
+        queue = self._fair_queues.get(bucket)
+        waiter = queue.register(item.weight, SyncFairWaiter)
+        try:
+            while True:
+                if deadline is not None and deadline - monotonic() <= 0:
+                    raise TimeoutError()
+
+                if not queue.is_head(waiter):
+                    # Atomic re-arm + head check closes the race with the head's
+                    # leave/promote: a promotion signal can never be cleared.
+                    if queue.begin_park(waiter):
+                        continue
+                    if not waiter.wait(self._fair_head_timeout(deadline)):
+                        raise TimeoutError()
+                    continue
+
+                # Head: probe capacity under the limiter lock (released after).
+                remaining: Union[int, float] = -1 if deadline is None else max(0.0, deadline - monotonic())
+                with combined_lock(self.lock, blocking=True, timeout=remaining):
+                    if not queue.is_head(waiter):
+                        # Lost the head race while acquiring the global lock.
+                        continue
+                    if bucket.exceeds_capacity(item.weight):
+                        return False
+                    refreshed = self._refresh_item(item)
+                    assert not isawaitable(refreshed)
+                    if bucket.put(item):
+                        return True
+                    next_wait = bucket.waiting(item)
+                    if isawaitable(next_wait):
+                        # A nominally-sync bucket returned an awaitable mid-wait;
+                        # hand off to the async fair tail.
+                        return self._handle_async_result(
+                            self._fair_wait_async(bucket, item, deadline),
+                            deadline=deadline,
+                        )
+                    assert isinstance(next_wait, int)
+
+                # Wait one bounded poll slice with the lock released, then
+                # re-probe. The head uses a plain sleep (not its promotion
+                # gate), so its cadence is independent of promotion signalling
+                # and the poll slice bounds how long a capacity change goes
+                # unnoticed. The loop-top deadline check raises on timeout.
+                sleep(self._fair_poll_seconds(deadline))
+        finally:
+            queue.promote(queue.leave(waiter))
+
+    def _fair_poll_seconds(self, deadline: Optional[float]) -> float:
+        """One head retry slice, bounded by the caller's deadline."""
+        slice_secs = _FAIR_POLL_MS / 1000
+        if deadline is None:
+            return slice_secs
+        return max(0.0, min(slice_secs, deadline - monotonic()))
+
+    @staticmethod
+    def _fair_head_timeout(deadline: Optional[float]) -> Optional[float]:
+        """Bounded wait for a non-head waiter, or ``None`` (wait indefinitely)
+        when there is no deadline."""
+        if deadline is None:
+            return None
+        return max(0.0, deadline - monotonic())
+
+    async def _fair_wait_async(
+        self,
+        bucket: AbstractBucket,
+        item: RateItem,
+        deadline: Optional[float],
+    ) -> bool:
+        """Blocking FIFO wait for an async caller.
+
+        Async counterpart of :meth:`_fair_wait_sync`: parked waiters block on an
+        :class:`asyncio.Event` promotion gate; the head probes and sleeps in
+        short :func:`asyncio.sleep` slices. No limiter lock is held across an
+        ``await``; consistency comes from the bucket's own lock and the event
+        loop's single-threaded execution.
+        """
+        queue = self._fair_queues.get(bucket)
+        waiter = queue.register(item.weight, AsyncFairWaiter)
+        try:
+            while True:
+                if deadline is not None and deadline - monotonic() <= 0:
+                    raise TimeoutError()
+
+                if not queue.is_head(waiter):
+                    if queue.begin_park(waiter):
+                        continue
+                    if not await waiter.wait(self._fair_head_timeout(deadline)):
+                        raise TimeoutError()
+                    continue
+
+                # Head: probe. Config-level rejection before any state-mutating put.
+                if bucket.exceeds_capacity(item.weight):
+                    return False
+
+                refreshed = self._refresh_item(item)
+                if isawaitable(refreshed):
+                    refreshed = await refreshed
+                assert isinstance(refreshed, RateItem)
+
+                acquire = bucket.put(item)
+                if isawaitable(acquire):
+                    acquire = await self._handle_async_result(acquire, deadline=deadline)
+                if acquire:
+                    return True
+
+                wait_ms = bucket.waiting(item)
+                if isawaitable(wait_ms):
+                    wait_ms = await wait_ms
+                assert isinstance(wait_ms, int)
+
+                # Bounded poll slice; the loop-top deadline check governs timeout.
+                await asyncio.sleep(self._fair_poll_seconds(deadline))
+        finally:
+            await queue.promote_async(queue.leave(waiter))
+
+    def wake_waiters(self, bucket: Union[int, AbstractBucket]) -> None:
+        """Nudge the head waiter queued on ``bucket``.
+
+        Deterministic-testing / shutdown helper: the head re-checks its
+        position and capacity before acting, so the call is harmless when the
+        queue is empty or capacity has not changed. Accepts a bucket object or
+        its ``id()``. Parked waiters are never woken here - they advance only
+        via FIFO promotion, which preserves admission order.
+        """
+        if isinstance(bucket, int):
+            queue = self._fair_queues._queues.get(bucket)
+            if queue is not None:
+                queue.wake_head()
+            return
+        self._fair_queues.wake(bucket)
+
+    async def wake_waiters_async(self, bucket: AbstractBucket) -> None:
+        """Async counterpart of :meth:`wake_waiters`."""
+        await self._fair_queues.wake_async(bucket)
+
     def _get_async_lock(self):
         """Returns thread_local, loop-specific lock"""
         loop = asyncio.get_running_loop()
@@ -584,6 +771,9 @@ class Limiter:
         """
 
         deadline: Optional[float] = monotonic() + timeout if timeout != -1 else None
+        # Set inside the lock for a fair sync caller; consumed after the lock is
+        # released so the blocking FIFO wait never holds the global lock.
+        fair_handoff = None
 
         with combined_lock(self.lock, blocking=blocking, timeout=timeout):
             assert weight >= 0, "item's weight must be >= 0"
@@ -626,6 +816,11 @@ class Limiter:
                 if not _force_async and not _allow_async_result:
                     self._cleanup_awaitable(acquire)
                     raise RuntimeError("Can't use async bucket with sync decorator")
+                if self.fair_wait:
+                    return self._handle_async_result(
+                        self._fair_after_async_put(bucket, item, acquire, deadline),
+                        deadline=deadline,
+                    )
                 return self._handle_async_result(
                     self._wait_after_async_put(bucket, item, acquire, blocking=blocking, deadline=deadline),
                     deadline=deadline,
@@ -637,25 +832,66 @@ class Limiter:
             if not blocking:
                 return False
 
-            if _force_async:
-                # Async caller (try_acquire_async) over a sync bucket: keep the
-                # async delay loop (asyncio.sleep). The coroutine runs after this
-                # `with` exits, so the lock is not held during the wait anyway.
-                result = self._delay_waiter(bucket, item, blocking=blocking, _force_async=True, deadline=deadline)
-                return self._handle_async_result(result, deadline=deadline)
+            # A weight above every rate's maximum can never be admitted. In fair
+            # mode decide that from the rate configuration (not put()'s mutable
+            # failing_rate), while the lock is held and BEFORE joining the FIFO,
+            # so an impossible request never parks itself at the head and blocks
+            # everyone behind it.
+            if self.fair_wait and bucket.exceeds_capacity(item.weight):
+                return False
 
-            # Sync caller: the first put failed and we will block. Capture the
-            # wait here (failing_rate is consistent under the lock), then leave
-            # the lock so the blocking sleep does not serialize other keys (#301).
             wait_ms = bucket.waiting(item)
-            if isawaitable(wait_ms):
-                # Defensive parity with the old sync path: a bucket with a sync
-                # put() but an async waiting(). Fall back to the async delay loop.
-                result = self._delay_waiter(bucket, item, blocking=blocking, _force_async=True, deadline=deadline)
-                return self._handle_async_result(result, deadline=deadline)
-            assert isinstance(wait_ms, int)
+            is_async_wait = isawaitable(wait_ms)
+
+            if self.fair_wait:
+                if _force_async:
+                    return self._handle_async_result(
+                        self._fair_wait_async(bucket, item, deadline), deadline=deadline
+                    )
+                if is_async_wait:
+                    # Sync put() but async waiting(): drive the async fair loop.
+                    return self._handle_async_result(
+                        self._fair_wait_async(bucket, item, deadline), deadline=deadline
+                    )
+                # Sync caller: hand off after the lock is released below, so the
+                # head's blocking sleep neither holds the global lock nor
+                # serializes other buckets (mirrors _blocking_retry_sync, #301).
+                fair_handoff = (bucket, item, deadline, wait_ms)
+            else:
+                if _force_async:
+                    # Async caller (try_acquire_async) over a sync bucket: keep the
+                    # async delay loop (asyncio.sleep). The coroutine runs after this
+                    # `with` exits, so the lock is not held during the wait anyway.
+                    result = self._delay_waiter(bucket, item, blocking=blocking, _force_async=True, deadline=deadline)
+                    return self._handle_async_result(result, deadline=deadline)
+
+                # Sync caller: the first put failed and we will block. Capture the
+                # wait here (failing_rate is consistent under the lock), then leave
+                # the lock so the blocking sleep does not serialize other keys (#301).
+                if is_async_wait:
+                    # Defensive parity with the old sync path: a bucket with a sync
+                    # put() but an async waiting(). Fall back to the async delay loop.
+                    result = self._delay_waiter(bucket, item, blocking=blocking, _force_async=True, deadline=deadline)
+                    return self._handle_async_result(result, deadline=deadline)
+                assert isinstance(wait_ms, int)
+
+        if fair_handoff is not None:
+            handoff_bucket, handoff_item, fair_deadline, _ = fair_handoff
+            return self._fair_wait_sync(handoff_bucket, handoff_item, fair_deadline)
 
         return self._blocking_retry_sync(bucket, item, wait_ms, blocking=blocking, deadline=deadline)
+
+    async def _fair_after_async_put(self, bucket, item, acquire, deadline):
+        """Fair counterpart of ``_wait_after_async_put``: resolve an awaitable
+        ``put``, then either admit immediately or join the per-bucket FIFO.
+        """
+        acquire_result = await self._handle_async_result(acquire, deadline=deadline)
+        if acquire_result:
+            return True
+
+        if bucket.exceeds_capacity(item.weight):
+            return False
+        return await self._fair_wait_async(bucket, item, deadline)
 
     def as_decorator(self, *, name="ratelimiter", weight=1):
         def deco(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -710,6 +946,9 @@ class Limiter:
         state = self.__dict__.copy()
         state.pop("lock", None)
         state.pop("_thread_local", None)
+        # Conditions and locks cannot cross a process boundary; rebuild an empty
+        # per-bucket registry on unpickle (in-flight waiters are not preserved).
+        state.pop("_fair_queues", None)
         return state
 
     def __setstate__(self, state):
@@ -717,3 +956,4 @@ class Limiter:
         self.__dict__.update(state)
         self.lock = RLock()
         self._thread_local = local()
+        self._fair_queues = FairQueueRegistry()

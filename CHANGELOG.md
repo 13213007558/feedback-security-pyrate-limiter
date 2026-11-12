@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Optional per-bucket fair (FIFO) waiting.** `Limiter(..., fair_wait=True)`
+  makes blocking waiters on the same bucket admit strictly in enqueue order, so
+  a later small-weight request can no longer starve an earlier large one. An
+  over-capacity weight is rejected immediately without holding the queue head, a
+  cancelled or timed-out waiter promotes the next one, and queues are isolated
+  per bucket. The sync path parks on a `threading.Event` and the async path on
+  an `asyncio.Event`, never while the limiter lock is held. The default
+  (`fair_wait=False`) keeps the higher-throughput, non-fair behaviour.
+- **`AbstractBucket.exceeds_capacity(weight)`.** A state-independent check for
+  "this weight can never fit", used by the fair head so a large request's
+  recorded wait is never mistaken for another waiter's verdict.
+
 ### Fixed
 - **A blocking `try_acquire()` could give up on an item that fits.**
   `SlidingWindowLog.retry_after` returned `blocking_timestamp + interval - now + 1`,

@@ -143,6 +143,18 @@ class AbstractBucket(ABC):
         we can't really tell how many outdated items are still in the queue
         """
 
+    def exceeds_capacity(self, weight: int) -> bool:
+        """Whether ``weight`` can *never* be admitted under any configured rate.
+
+        Unlike :meth:`waiting`, this reads only the rate configuration
+        (``algorithm.max_weight``) and never the mutable ``failing_rate`` /
+        ``_last_wait`` state that :meth:`put` rewrites. That makes it safe for a
+        fair-wait head to call repeatedly: a large head's failed ``put`` records
+        its own wait, which must not be mistaken for the -1 ("can never fit")
+        verdict of a differently-weighted waiter behind it.
+        """
+        return any(weight > self._algorithm.max_weight(rate) for rate in self._rates)
+
     def waiting(self, item: RateItem) -> Union[int, Awaitable[int]]:
         """Calculate time until bucket become availabe to consume an item again"""
         # Read once: a put() outside the limiter's lock, such as a client
